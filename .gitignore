@@ -1,5 +1,30 @@
-node_modules
-# Keep environment variables out of version control
-.env
+# Build artifacts
+target/
+*.wasm
 
-/generated/prisma
+# Dependencies
+node_modules/
+
+# Frontend build
+frontend/.next/
+frontend/out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.production
+deployed.json
+
+# Logs
+*.log
+pr.md
