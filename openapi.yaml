@@ -1,0 +1,331 @@
+openapi: 3.1.0
+info:
+  title: OrbitPay API
+  version: 1.0.0
+  description: OrbitPay analytics and payment-streaming API
+
+servers:
+  - url: http://localhost:3001
+    description: Local development
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+        requestId:
+          type: string
+
+    PaginationMeta:
+      type: object
+      properties:
+        total:
+          type: integer
+        page:
+          type: integer
+        limit:
+          type: integer
+        totalPages:
+          type: integer
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      tags: [Health]
+      responses:
+        '200':
+          description: All dependencies healthy
+        '503':
+          description: One or more dependencies degraded
+
+  /auth/nonce:
+    post:
+      summary: Request a wallet authentication nonce
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [walletAddress]
+              properties:
+                walletAddress:
+                  type: string
+                  pattern: '^G[A-Z2-7]{55}$'
+      responses:
+        '200':
+          description: Nonce issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  walletAddress:
+                    type: string
+                  nonce:
+                    type: string
+                  message:
+                    type: string
+                  expiresInSeconds:
+                    type: integer
+        '400':
+          description: Invalid wallet address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/verify:
+    post:
+      summary: Verify wallet signature and obtain a JWT
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [walletAddress, signature]
+              properties:
+                walletAddress:
+                  type: string
+                  pattern: '^G[A-Z2-7]{55}$'
+                signature:
+                  type: string
+                  description: Base64-encoded Ed25519 signature of the challenge message
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Invalid or expired nonce / bad signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/streams:
+    get:
+      summary: List payment streams
+      tags: [Streams]
+      parameters:
+        - in: query
+          name: sender
+          schema:
+            type: string
+            pattern: '^G[A-Z2-7]{55}$'
+        - in: query
+          name: recipient
+          schema:
+            type: string
+            pattern: '^G[A-Z2-7]{55}$'
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
+        - in: query
+          name: cursor
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Paginated streams
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/streams/{id}:
+    get:
+      summary: Get stream detail with claim history
+      tags: [Streams]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Stream detail
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/treasury/{addr}/events:
+    get:
+      summary: Treasury event log for an address
+      tags: [Treasury]
+      parameters:
+        - in: path
+          name: addr
+          required: true
+          schema:
+            type: string
+            pattern: '^G[A-Z2-7]{55}$'
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
+        - in: query
+          name: cursor
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Paginated treasury events
+        '400':
+          description: Invalid address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/proposals:
+    get:
+      summary: List governance proposals
+      tags: [Proposals]
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
+      responses:
+        '200':
+          description: Paginated proposals
+
+  /api/proposals/{id}:
+    get:
+      summary: Get proposal detail
+      tags: [Proposals]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Proposal
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/proposals/{id}/votes:
+    get:
+      summary: List votes for a proposal
+      tags: [Proposals]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: page
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
+      responses:
+        '200':
+          description: Paginated votes
+
+  /api/vesting:
+    get:
+      summary: List vesting schedules for a beneficiary
+      tags: [Vesting]
+      parameters:
+        - in: query
+          name: beneficiary
+          required: true
+          schema:
+            type: string
+            pattern: '^G[A-Z2-7]{55}$'
+      responses:
+        '200':
+          description: Vesting schedules
+        '400':
+          description: Invalid or missing beneficiary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/vesting/{id}/progress:
+    get:
+      summary: Get vesting progress for a schedule
+      tags: [Vesting]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Vesting progress
+        '404':
+          description: Schedule not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'

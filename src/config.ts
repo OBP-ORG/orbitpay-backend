@@ -20,4 +20,9 @@ export const config = {
       toNumber(process.env.RATE_LIMIT_BACKOFF_BASE_SECONDS, 60) * 1000,
   },
   indexerPollIntervalMs: toNumber(process.env.INDEXER_POLL_INTERVAL_MS, 5000),
+  jwtSecret: process.env.JWT_SECRET ?? 'change-me-in-production',
+  jwtTtlSeconds: toNumber(process.env.JWT_TTL_SECONDS, 3600),
+  trustProxy: process.env.TRUST_PROXY ?? 'loopback',
+  dbQueryTimeoutMs: toNumber(process.env.DB_QUERY_TIMEOUT_MS, 5000),
+  redisSocketTimeoutMs: toNumber(process.env.REDIS_SOCKET_TIMEOUT_MS, 3000),
 };
