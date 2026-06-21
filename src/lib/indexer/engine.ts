@@ -52,52 +52,48 @@ const extractAddress = (data: Record<string, unknown>): string | null => {
   return null;
 };
 
-const extractAmount = (data: Record<string, unknown>): number | null => {
+const extractAmount = (data: Record<string, unknown>): bigint | null => {
   const fields = ['amount', 'earned', 'total_paid', 'cliff_amount'];
   for (const field of fields) {
     const val = data[field];
-    if (typeof val === 'number') return val;
-    if (typeof val === 'string') {
-      const parsed = parseFloat(val);
-      if (!isNaN(parsed)) return parsed;
-    }
+    if (typeof val === 'bigint') return val;
+    if (typeof val === 'number' && Number.isSafeInteger(val)) return BigInt(val);
+    if (typeof val === 'string' && /^-?\d+$/.test(val.trim())) return BigInt(val.trim());
   }
   return null;
 };
 
-const extractProposalId = (data: Record<string, unknown>): number | null => {
+const extractProposalId = (data: Record<string, unknown>): bigint | null => {
   const val = data.proposal_id ?? data.proposalId;
-  if (typeof val === 'number') return val;
-  if (typeof val === 'string') {
-    const parsed = parseInt(val, 10);
-    if (!isNaN(parsed)) return parsed;
-  }
+  if (typeof val === 'bigint') return val;
+  if (typeof val === 'number' && Number.isSafeInteger(val)) return BigInt(val);
+  if (typeof val === 'string' && /^-?\d+$/.test(val.trim())) return BigInt(val.trim());
   return null;
 };
 
-const extractStreamId = (data: Record<string, unknown>): number | null => {
+const extractStreamId = (data: Record<string, unknown>): bigint | null => {
   const val = data.stream_id ?? data.streamId;
-  if (typeof val === 'number') return val;
-  if (typeof val === 'string') {
-    const parsed = parseInt(val, 10);
-    if (!isNaN(parsed)) return parsed;
-  }
+  if (typeof val === 'bigint') return val;
+  if (typeof val === 'number' && Number.isSafeInteger(val)) return BigInt(val);
+  if (typeof val === 'string' && /^-?\d+$/.test(val.trim())) return BigInt(val.trim());
   return null;
 };
 
 const upsertEvent = async (event: DecodedEvent): Promise<void> => {
   const data = event.data;
 
-  if (event.contractId === config.contracts.treasury || event.contractId === '') {
+  if (event.contractId === config.contracts.treasury) {
+    const rawAmount = extractAmount(data);
+    const rawProposalId = extractProposalId(data);
     await prisma.treasuryEvent.upsert({
       where: { txHash: event.txHash },
       create: {
         treasuryAddress: event.contractId,
         eventType: event.topic,
         address: extractAddress(data),
-        amount: extractAmount(data),
+        amount: rawAmount !== null ? Number(rawAmount) : null,
         token: typeof data.token === 'string' ? data.token : null,
-        proposalId: extractProposalId(data),
+        proposalId: rawProposalId !== null ? Number(rawProposalId) : null,
         metadata: data as Prisma.InputJsonValue,
       },
       update: { metadata: data as Prisma.InputJsonValue },
@@ -107,10 +103,14 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
   }
 
   if (event.contractId === config.contracts.payrollStream) {
-    const streamId = extractStreamId(data) ?? 0;
-    if (streamId === 0 && event.topic === 'StreamCreated') return;
+    const streamId = extractStreamId(data);
+    if (streamId === null && event.topic === 'StreamCreated') {
+      await quarantineEvent(event, 'StreamCreated event missing stream_id');
+      return;
+    }
 
     if (['StreamCreated', 'StreamClaimed', 'StreamCancelled', 'StreamPaused', 'StreamResumed'].includes(event.topic)) {
+      const sid = Number(streamId ?? 0);
       const statusMap: Record<string, string> = {
         StreamCreated: 'active',
         StreamCancelled: 'cancelled',
@@ -120,13 +120,13 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       };
 
       await prisma.stream.upsert({
-        where: { contractStreamId: streamId },
+        where: { contractStreamId: sid },
         create: {
-          contractStreamId: streamId,
+          contractStreamId: sid,
           sender: typeof data.sender === 'string' ? data.sender : '',
           recipient: typeof data.recipient === 'string' ? data.recipient : '',
           token: typeof data.token === 'string' ? data.token : '',
-          totalAmount: extractAmount(data) ?? 0,
+          totalAmount: Number(extractAmount(data) ?? 0),
           startTime: new Date(),
           endTime: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
           status: statusMap[event.topic] ?? 'active',
@@ -134,20 +134,20 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
         update: {
           status: statusMap[event.topic],
           ...(event.topic === 'StreamClaimed' && {
-            claimedAmount: { increment: extractAmount(data) ?? 0 },
+            claimedAmount: { increment: Number(extractAmount(data) ?? 0) },
           }),
         },
       });
 
       if (event.topic === 'StreamClaimed') {
         const existing = await prisma.stream.findUnique({
-          where: { contractStreamId: streamId },
+          where: { contractStreamId: sid },
         });
         if (existing) {
           await prisma.claimEvent.create({
             data: {
               streamId: existing.id,
-              amount: extractAmount(data) ?? 0,
+              amount: Number(extractAmount(data) ?? 0),
             },
           });
         }
@@ -172,7 +172,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
         id: scheduleId,
         grantor: typeof data.grantor === 'string' ? data.grantor : '',
         beneficiary: typeof data.beneficiary === 'string' ? data.beneficiary : '',
-        amount: extractAmount(data) ?? 0,
+        amount: Number(extractAmount(data) ?? 0),
         status: statusMap[event.topic] ?? 'active',
         startTime: new Date(),
         endTime: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
@@ -199,43 +199,37 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
         id: proposalId,
         proposer: typeof data.proposer === 'string' ? data.proposer : '',
         title: typeof data.title === 'string' ? data.title : '',
-        amount: extractAmount(data) ?? 0,
+        amount: Number(extractAmount(data) ?? 0),
         status: statusMap[event.topic] ?? 'active',
       },
       update: { status: statusMap[event.topic] },
     });
 
     if (event.topic === 'VoteCast') {
-      await prisma.vote.create({
-        data: {
+      const voterAddr = typeof data.voter === 'string' ? data.voter : '';
+      const voteWeight = typeof data.weight === 'number' ? data.weight : 1;
+      await prisma.vote.upsert({
+        where: { proposalId_voter: { proposalId, voter: voterAddr } },
+        create: {
           proposalId,
-          voter: typeof data.voter === 'string' ? data.voter : '',
+          voter: voterAddr,
           support: data.choice === 'For' || data.support === true || data.support === 'true',
-          weight: typeof data.weight === 'number' ? data.weight : 1,
+          weight: voteWeight,
         },
-      });
-      await prisma.proposal.update({
-        where: { id: proposalId },
-        data: { voteCount: { increment: 1 } },
+        update: {
+          support: data.choice === 'For' || data.support === true || data.support === 'true',
+          weight: voteWeight,
+        },
       });
     }
     eventsProcessed.inc({ contract: 'governance' });
     return;
   }
 
-  await prisma.treasuryEvent.upsert({
-    where: { txHash: event.txHash },
-    create: {
-      treasuryAddress: event.contractId,
-      eventType: event.topic,
-      address: extractAddress(data),
-      amount: extractAmount(data),
-      token: typeof data.token === 'string' ? data.token : null,
-      proposalId: extractProposalId(data),
-      metadata: data as Prisma.InputJsonValue,
-    },
-    update: { metadata: data as Prisma.InputJsonValue },
-  });
+  await quarantineEvent(
+    event,
+    `unknown contract ${event.contractId} — not in configured contract registry`,
+  );
   eventsProcessed.inc({ contract: 'unknown' });
 };
 
@@ -319,6 +313,10 @@ export const createIndexerEngine = () => {
           }
         }
 
+        const maxEventLedger = events.length > 0
+          ? Math.max(...events.map((e) => e.ledger))
+          : startLedger ?? latestLedger;
+
         if (events.length > 0) {
           const { processed, quarantined } = await processEvents(events);
           console.log(
@@ -326,15 +324,15 @@ export const createIndexerEngine = () => {
           );
         }
 
-        await setCheckpoint(latestLedger);
-        indexedLedger.set(latestLedger);
+        await setCheckpoint(maxEventLedger);
+        indexedLedger.set(maxEventLedger);
 
-        if (startLedger) {
-          const lag = Math.max(0, (latestLedger - (startLedger as number)) * 5);
+        if (maxEventLedger) {
+          const lag = Math.max(0, (latestLedger - maxEventLedger) * 5);
           lagSeconds.set(lag);
         }
 
-        state.currentLedger = latestLedger;
+        state.currentLedger = maxEventLedger;
         state.lastSuccessfulPollAt = new Date().toISOString();
         state.lastError = null;
         return;
@@ -349,16 +347,25 @@ export const createIndexerEngine = () => {
     console.error('Indexer poll failed after retries:', lastErrorMsg);
   };
 
+  let pollInterval: ReturnType<typeof setInterval> | null = null;
+
   const start = (): void => {
-    setInterval(() => {
+    pollInterval = setInterval(() => {
       void poll();
     }, config.indexer.pollIntervalMs);
     void poll();
+  };
+
+  const stop = (): void => {
+    if (pollInterval !== null) {
+      clearInterval(pollInterval);
+      pollInterval = null;
+    }
   };
 
   const getMetrics = async (): Promise<string> => {
     return registry.metrics();
   };
 
-  return { start, getMetrics, getState: () => ({ ...state }) };
+  return { start, stop, getMetrics, getState: () => ({ ...state }) };
 };

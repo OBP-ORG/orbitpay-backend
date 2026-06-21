@@ -64,6 +64,7 @@ model Vote {
   weight     Decimal  @db.Decimal(36, 7)
   createdAt  DateTime @default(now()) @map("created_at")
 
+  @@unique([proposalId, voter])
   @@index([proposalId, createdAt])
   @@map("proposal_votes")
 }

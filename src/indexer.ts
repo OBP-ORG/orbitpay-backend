@@ -32,7 +32,19 @@ app.get('/metrics', async (_req, res) => {
   res.send(await engine.getMetrics());
 });
 
-app.listen(config.indexerPort, () => {
+const server = app.listen(config.indexerPort, () => {
   console.log(`OrbitPay indexer is running on port ${config.indexerPort}`);
   engine.start();
+});
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down indexer...');
+  engine.stop();
+  server.close();
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down indexer...');
+  engine.stop();
+  server.close();
 });
