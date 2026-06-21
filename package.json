@@ -11,8 +11,10 @@
     "start:indexer": "node dist/indexer.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate:deploy": "prisma migrate deploy",
-    "test": "npm run build",
-    "test:unit": "node -r ts-node/register/transpile-only --test src/reconciliation/canonical.test.ts src/reconciliation/compare.test.ts"
+    "test": "jest --runInBand",
+    "test:coverage": "jest --coverage --runInBand",
+    "test:unit": "node -r ts-node/register/transpile-only --test src/reconciliation/canonical.test.ts src/reconciliation/compare.test.ts",
+    "lint": "tsc --noEmit"
   },
   "keywords": [],
   "author": "",
@@ -28,8 +30,13 @@
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/jest": "^30.0.0",
     "@types/node": "^25.5.0",
+    "@types/supertest": "^7.2.0",
+    "jest": "^30.4.2",
     "prisma": "^5.22.0",
+    "supertest": "^7.2.2",
+    "ts-jest": "^29.4.11",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.2"
   }

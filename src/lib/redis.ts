@@ -18,13 +18,14 @@ export const getRedisClient = async (): Promise<OrbitPayRedisClient> => {
   const client = createClient({
     url: config.redisUrl,
     socket: {
+      connectTimeout: config.redisSocketTimeoutMs,
       reconnectStrategy: (retries: number) =>
         Math.min(1000 * 2 ** retries, 10_000),
     },
   });
 
   client.on('error', (error: unknown) => {
-    console.error('Redis client error', error);
+    console.error(JSON.stringify({ level: 'error', msg: 'Redis client error', meta: String(error) }));
   });
 
   redisConnectPromise = client.connect().then(() => {
