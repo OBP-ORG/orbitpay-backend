@@ -27,7 +27,7 @@ model VestingSchedule {
   organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   grantor        String
   beneficiary    String
-  amount         Float
+  amount         Decimal       @db.Decimal(36, 7)
   status         String
   startTime      DateTime      @default(now()) @map("start_time")
   endTime        DateTime      @map("end_time")
@@ -44,7 +44,7 @@ model Proposal {
   organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   proposer       String
   title          String
-  amount         Float
+  amount         Decimal       @db.Decimal(36, 7)
   status         String
   voteCount      Int           @default(0) @map("vote_count")
   votes          Vote[]
@@ -61,7 +61,7 @@ model Vote {
   proposal   Proposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
   voter      String
   support    Boolean
-  weight     Float
+  weight     Decimal  @db.Decimal(36, 7)
   createdAt  DateTime @default(now()) @map("created_at")
 
   @@index([proposalId, createdAt])
@@ -76,8 +76,8 @@ model Stream {
   sender           String
   recipient        String
   token            String
-  totalAmount      Float         @map("total_amount")
-  claimedAmount    Float         @default(0) @map("claimed_amount")
+  totalAmount      Decimal       @db.Decimal(36, 7) @map("total_amount")
+  claimedAmount    Decimal       @default(0) @db.Decimal(36, 7) @map("claimed_amount")
   startTime        DateTime      @map("start_time")
   endTime          DateTime      @map("end_time")
   status           String        @default("active")
@@ -95,7 +95,7 @@ model ClaimEvent {
   id        String   @id @default(uuid())
   streamId  String   @map("stream_id")
   stream    Stream   @relation(fields: [streamId], references: [id], onDelete: Cascade)
-  amount    Float
+  amount    Decimal  @db.Decimal(36, 7)
   timestamp DateTime @default(now())
 
   @@index([streamId, timestamp])
@@ -109,7 +109,7 @@ model TreasuryEvent {
   treasuryAddress String        @map("treasury_address")
   eventType       String        @map("event_type")
   address         String?
-  amount          Float?
+  amount          Decimal?      @db.Decimal(36, 7)
   token           String?
   txHash          String?       @unique @map("tx_hash")
   proposalId      Int?          @map("proposal_id")

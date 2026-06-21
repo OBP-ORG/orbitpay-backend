@@ -51,17 +51,17 @@ router.get('/:id/progress', async (req, res, next) => {
     const totalDuration = schedule.endTime.getTime() - schedule.startTime.getTime();
     const elapsed = now.getTime() - schedule.startTime.getTime();
 
-    let progress = totalDuration > 0 ? elapsed / totalDuration : 0;
-    if (progress < 0) progress = 0;
-    if (progress > 1) progress = 1;
+    // progress is a display ratio (0–1), not a stored value — floating-point is fine here
+    const progress = Math.min(1, Math.max(0, totalDuration > 0 ? elapsed / totalDuration : 0));
 
-    const amount = new Prisma.Decimal(schedule.amount);
-    const vestedAmount = amount.mul(new Prisma.Decimal(progress));
+    // Multiply using Decimal to avoid floating-point error in the accounting result
+    const vestedAmount = schedule.amount.mul(new Prisma.Decimal(progress));
 
+    // Amounts serialised as strings to prevent JSON precision loss
     res.json({
       scheduleId: id,
-      totalAmount: amount.toNumber(),
-      vestedAmount: vestedAmount.toNumber(),
+      totalAmount: schedule.amount.toFixed(),
+      vestedAmount: vestedAmount.toFixed(),
       progressPercentage: progress * 100,
     });
   } catch (error) {

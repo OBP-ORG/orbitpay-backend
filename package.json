@@ -13,7 +13,7 @@
     "prisma:migrate:deploy": "prisma migrate deploy",
     "test": "jest --runInBand",
     "test:coverage": "jest --coverage --runInBand",
-    "test:unit": "node -r ts-node/register/transpile-only --test src/reconciliation/canonical.test.ts src/reconciliation/compare.test.ts",
+    "test:unit": "node -r ts-node/register/transpile-only --test src/reconciliation/canonical.test.ts src/reconciliation/compare.test.ts src/__tests__/decimal-precision.test.ts",
     "lint": "tsc --noEmit"
   },
   "keywords": [],
