@@ -60,8 +60,8 @@ router.get('/:id/progress', async (req, res, next) => {
     // Amounts serialised as strings to prevent JSON precision loss
     res.json({
       scheduleId: id,
-      totalAmount: schedule.amount.toString(),
-      vestedAmount: vestedAmount.toString(),
+      totalAmount: schedule.amount.toFixed(),
+      vestedAmount: vestedAmount.toFixed(),
       progressPercentage: progress * 100,
     });
   } catch (error) {

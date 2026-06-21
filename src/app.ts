@@ -20,7 +20,7 @@ export const createApiApp = () => {
   // Serialise Prisma Decimal instances as strings so monetary fields never
   // appear as `{}` in JSON responses (Decimal is not a plain JS number).
   app.set('json replacer', (_key: string, value: unknown) => {
-    if (value instanceof Prisma.Decimal) return value.toString();
+    if (value instanceof Prisma.Decimal) return value.toFixed();
     return value;
   });
 
