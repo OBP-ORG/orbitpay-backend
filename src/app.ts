@@ -1,5 +1,6 @@
 import cors from 'cors';
 import express from 'express';
+import { Prisma } from '@prisma/client';
 import { config } from './config';
 import { requestIdMiddleware } from './middleware/requestId';
 import { rateLimitMiddleware } from './middleware/rateLimit';
@@ -15,6 +16,13 @@ export const createApiApp = () => {
 
   // Trust the proxy topology so rate limiting reads real client IPs
   app.set('trust proxy', config.trustProxy);
+
+  // Serialise Prisma Decimal instances as strings so monetary fields never
+  // appear as `{}` in JSON responses (Decimal is not a plain JS number).
+  app.set('json replacer', (_key: string, value: unknown) => {
+    if (value instanceof Prisma.Decimal) return value.toString();
+    return value;
+  });
 
   app.use(requestIdMiddleware);
   app.use(cors());

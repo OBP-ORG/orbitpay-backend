@@ -9,34 +9,34 @@
 DO $$
 BEGIN
   IF EXISTS (
-    SELECT 1 FROM vesting_schedules WHERE amount > 9.9999999999999999999999999999e28::float8
+    SELECT 1 FROM vesting_schedules WHERE amount > '99999999999999999999999999999.9999999'::NUMERIC
   ) THEN
     RAISE EXCEPTION 'vesting_schedules.amount contains values out of NUMERIC(36,7) range';
   END IF;
   IF EXISTS (
-    SELECT 1 FROM proposals WHERE amount > 9.9999999999999999999999999999e28::float8
+    SELECT 1 FROM proposals WHERE amount > '99999999999999999999999999999.9999999'::NUMERIC
   ) THEN
     RAISE EXCEPTION 'proposals.amount contains values out of NUMERIC(36,7) range';
   END IF;
   IF EXISTS (
-    SELECT 1 FROM proposal_votes WHERE weight > 9.9999999999999999999999999999e28::float8
+    SELECT 1 FROM proposal_votes WHERE weight > '99999999999999999999999999999.9999999'::NUMERIC
   ) THEN
     RAISE EXCEPTION 'proposal_votes.weight contains values out of NUMERIC(36,7) range';
   END IF;
   IF EXISTS (
     SELECT 1 FROM streams
-    WHERE total_amount > 9.9999999999999999999999999999e28::float8
-       OR claimed_amount > 9.9999999999999999999999999999e28::float8
+    WHERE total_amount > '99999999999999999999999999999.9999999'::NUMERIC
+       OR claimed_amount > '99999999999999999999999999999.9999999'::NUMERIC
   ) THEN
     RAISE EXCEPTION 'streams contains values out of NUMERIC(36,7) range';
   END IF;
   IF EXISTS (
-    SELECT 1 FROM claim_events WHERE amount > 9.9999999999999999999999999999e28::float8
+    SELECT 1 FROM claim_events WHERE amount > '99999999999999999999999999999.9999999'::NUMERIC
   ) THEN
     RAISE EXCEPTION 'claim_events.amount contains values out of NUMERIC(36,7) range';
   END IF;
   IF EXISTS (
-    SELECT 1 FROM treasury_events WHERE amount > 9.9999999999999999999999999999e28::float8
+    SELECT 1 FROM treasury_events WHERE amount > '99999999999999999999999999999.9999999'::NUMERIC
   ) THEN
     RAISE EXCEPTION 'treasury_events.amount contains values out of NUMERIC(36,7) range';
   END IF;
