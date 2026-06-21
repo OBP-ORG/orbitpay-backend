@@ -61,11 +61,11 @@ const verifyWalletSignature = (
         bytes.push((bits >> bitsLen) & 0xff);
       }
     }
-    // bytes[0] = version byte (0x06 0x1e for Stellar G... keys)
+    // bytes[0]     = version byte (0x30 for G... account keys)
     // bytes[1..32] = raw 32-byte Ed25519 public key
     // bytes[33..34] = 2-byte checksum
     if (bytes.length < 35) return false;
-    const rawPublicKey = Buffer.from(bytes.slice(2, 34));
+    const rawPublicKey = Buffer.from(bytes.slice(1, 33));
 
     // Wrap raw 32-byte Ed25519 key in SPKI DER envelope so Node.js can import it
     const spkiDerPrefix = Buffer.from('302a300506032b6570032100', 'hex');

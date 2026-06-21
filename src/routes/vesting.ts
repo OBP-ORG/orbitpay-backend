@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { requireStellarAddress } from '../middleware/validate';
@@ -54,10 +55,13 @@ router.get('/:id/progress', async (req, res, next) => {
     if (progress < 0) progress = 0;
     if (progress > 1) progress = 1;
 
+    const amount = new Prisma.Decimal(schedule.amount);
+    const vestedAmount = amount.mul(new Prisma.Decimal(progress));
+
     res.json({
       scheduleId: id,
-      totalAmount: Number(schedule.amount),
-      vestedAmount: Number(schedule.amount) * progress,
+      totalAmount: amount.toNumber(),
+      vestedAmount: vestedAmount.toNumber(),
       progressPercentage: progress * 100,
     });
   } catch (error) {
