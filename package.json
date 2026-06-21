@@ -11,7 +11,8 @@
     "start:indexer": "node dist/indexer.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate:deploy": "prisma migrate deploy",
-    "test": "npm run build"
+    "test": "npm run build",
+    "test:unit": "node -r ts-node/register/transpile-only --test src/reconciliation/canonical.test.ts src/reconciliation/compare.test.ts"
   },
   "keywords": [],
   "author": "",
