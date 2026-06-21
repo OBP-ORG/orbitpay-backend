@@ -64,6 +64,7 @@ model Vote {
   weight     Decimal  @db.Decimal(36, 7)
   createdAt  DateTime @default(now()) @map("created_at")
 
+  @@unique([proposalId, voter])
   @@index([proposalId, createdAt])
   @@map("proposal_votes")
 }
@@ -120,4 +121,19 @@ model TreasuryEvent {
   @@index([organizationId, timestamp])
   @@index([treasuryAddress, timestamp])
   @@map("treasury_events")
+}
+
+model DeadLetterEvent {
+  id          String   @id @default(uuid())
+  eventId     String   @map("event_id")
+  ledger      Int
+  txHash      String   @map("tx_hash")
+  contractId  String   @map("contract_id")
+  topic       String
+  rawData     Json     @map("raw_data")
+  error       String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([ledger, txHash])
+  @@map("dead_letter_events")
 }
