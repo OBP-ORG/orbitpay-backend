@@ -53,6 +53,11 @@ paths:
   /auth/nonce:
     post:
       summary: Request a wallet authentication nonce
+      description: |
+        Issues a one-time challenge nonce for a Stellar wallet address.
+        The caller must sign the returned `message` string (UTF-8 encoded) with
+        their Ed25519 secret key and submit the 64-byte signature (base64) to
+        `POST /auth/verify` within 5 minutes.
       tags: [Auth]
       requestBody:
         required: true
@@ -65,9 +70,11 @@ paths:
                 walletAddress:
                   type: string
                   pattern: '^G[A-Z2-7]{55}$'
+                  description: Stellar Ed25519 public key in StrKey format (56-character G… address)
+                  example: GAEZI5NYGV2SSLA3CBGMONDNP74BG74A6BXQVF5SCIJVLKZ3DPAXMFN
       responses:
         '200':
-          description: Nonce issued
+          description: Nonce issued — sign the `message` field with your Ed25519 secret key
           content:
             application/json:
               schema:
@@ -77,10 +84,17 @@ paths:
                     type: string
                   nonce:
                     type: string
+                    description: Random hex nonce (64 hex chars)
                   message:
                     type: string
+                    description: Exact UTF-8 string the client must sign — "OrbitPay authentication nonce: <nonce>"
                   expiresInSeconds:
                     type: integer
+              example:
+                walletAddress: GAEZI5NYGV2SSLA3CBGMONDNP74BG74A6BXQVF5SCIJVLKZ3DPAXMFN
+                nonce: a3f9c12de04b17865e9f234abc78de01a3f9c12de04b17865e9f234abc78de01
+                message: "OrbitPay authentication nonce: a3f9c12de04b17865e9f234abc78de01a3f9c12de04b17865e9f234abc78de01"
+                expiresInSeconds: 300
         '400':
           description: Invalid wallet address
           content:
@@ -91,6 +105,16 @@ paths:
   /auth/verify:
     post:
       summary: Verify wallet signature and obtain a JWT
+      description: |
+        Verifies an Ed25519 signature over the challenge message issued by `POST /auth/nonce`.
+
+        **Signing protocol:**
+        1. Obtain `message` from `/auth/nonce` (format: `"OrbitPay authentication nonce: <nonce>"`).
+        2. Encode the message as UTF-8 bytes.
+        3. Sign the raw bytes with your Stellar Ed25519 secret key (no prehashing).
+        4. Base64-encode the 64-byte signature and submit it here.
+
+        The nonce is single-use: a successful or failed verification attempt consumes it.
       tags: [Auth]
       requestBody:
         required: true
@@ -103,12 +127,15 @@ paths:
                 walletAddress:
                   type: string
                   pattern: '^G[A-Z2-7]{55}$'
+                  description: The same Stellar public key used to request the nonce
+                  example: GAEZI5NYGV2SSLA3CBGMONDNP74BG74A6BXQVF5SCIJVLKZ3DPAXMFN
                 signature:
                   type: string
-                  description: Base64-encoded Ed25519 signature of the challenge message
+                  description: Base64-encoded 64-byte Ed25519 signature of the UTF-8 challenge message
+                  example: W+2rGpz3F8hqALj4Kne7XRcmT0YvdsBfNpIUoE1Czk9V6OxRHaJ5MtPsDwQlbYi/ZuKsNmOcXgvATEpWh8FDBA==
       responses:
         '200':
-          description: Authentication successful
+          description: Authentication successful — JWT `sub` is the authenticated wallet address
           content:
             application/json:
               schema:
@@ -116,14 +143,17 @@ paths:
                 properties:
                   token:
                     type: string
+                    description: HS256 JWT; include as `Authorization: Bearer <token>` on subsequent requests
+              example:
+                token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJHQUVaST...
         '400':
-          description: Bad request
+          description: Bad request (missing or malformed fields)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '401':
-          description: Invalid or expired nonce / bad signature
+          description: Invalid or expired nonce / signature verification failed
           content:
             application/json:
               schema:

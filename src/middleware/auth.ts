@@ -1,4 +1,5 @@
-import { createPublicKey, createVerify, randomBytes } from 'crypto';
+import { randomBytes } from 'crypto';
+import { Keypair } from '@stellar/stellar-sdk';
 import type { NextFunction, Request, Response } from 'express';
 import { getRedisClient } from '../lib/redis';
 import { logger } from '../lib/logger';
@@ -32,52 +33,25 @@ const consumeNonce = async (walletAddress: string): Promise<string | null> => {
 
 /**
  * Verify an Ed25519 signature produced by a Stellar wallet.
- * The client signs `buildChallengeMessage(nonce)` with their secret key;
- * we verify against their public key (wallet address decoded from base32).
+ *
+ * Uses `Keypair.fromPublicKey` from `@stellar/stellar-sdk` which:
+ *   - Decodes the StrKey (base32 + version byte + CRC-16 checksum) correctly.
+ *   - Validates the raw Ed25519 key length (must be exactly 32 bytes).
+ *   - Delegates signature verification to the SDK's Ed25519 primitive.
+ *
+ * The client signs `buildChallengeMessage(nonce)` (UTF-8) with their Ed25519
+ * secret key and submits the 64-byte signature base64-encoded.
  */
-const verifyWalletSignature = (
+export const verifyWalletSignature = (
   walletAddress: string,
   signature: string,
   nonce: string,
 ): boolean => {
   try {
-    // Stellar public keys are base32-encoded Ed25519 keys (with version byte + checksum).
-    // Strip the 1-byte version prefix (0x30) and 2-byte checksum to get 32-byte raw key.
-    const base32Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    const padded = walletAddress.toUpperCase().padEnd(
-      Math.ceil(walletAddress.length / 8) * 8,
-      '=',
-    );
-    let bits = 0;
-    let bitsLen = 0;
-    const bytes: number[] = [];
-    for (const ch of padded.replace(/=/g, '')) {
-      const val = base32Chars.indexOf(ch);
-      if (val === -1) return false;
-      bits = (bits << 5) | val;
-      bitsLen += 5;
-      if (bitsLen >= 8) {
-        bitsLen -= 8;
-        bytes.push((bits >> bitsLen) & 0xff);
-      }
-    }
-    // bytes[0]     = version byte (0x30 for G... account keys)
-    // bytes[1..32] = raw 32-byte Ed25519 public key
-    // bytes[33..34] = 2-byte checksum
-    if (bytes.length < 35) return false;
-    const rawPublicKey = Buffer.from(bytes.slice(1, 33));
-
-    // Wrap raw 32-byte Ed25519 key in SPKI DER envelope so Node.js can import it
-    const spkiDerPrefix = Buffer.from('302a300506032b6570032100', 'hex');
-    const spkiDer = Buffer.concat([spkiDerPrefix, rawPublicKey]);
-    const publicKey = createPublicKey({ key: spkiDer, format: 'der', type: 'spki' });
-
+    const keypair = Keypair.fromPublicKey(walletAddress);
     const message = Buffer.from(buildChallengeMessage(nonce), 'utf8');
     const sigBuf = Buffer.from(signature, 'base64');
-
-    const verify = createVerify('Ed25519');
-    verify.update(message);
-    return verify.verify(publicKey, sigBuf);
+    return keypair.verify(message, sigBuf);
   } catch {
     return false;
   }
