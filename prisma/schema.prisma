@@ -112,7 +112,8 @@ model TreasuryEvent {
   address         String?
   amount          Decimal?      @db.Decimal(36, 7)
   token           String?
-  txHash          String?       @unique @map("tx_hash")
+  txHash          String?       @map("tx_hash")
+  eventId         String?       @unique @map("event_id")
   proposalId      Int?          @map("proposal_id")
   metadata        Json?
   timestamp       DateTime      @default(now())
