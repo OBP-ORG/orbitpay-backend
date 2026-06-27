@@ -2,8 +2,9 @@ import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
 import { Prisma } from '@prisma/client';
 import { config } from '../../config';
 import { prisma } from '../prisma';
-import { getCheckpoint, setCheckpoint } from './checkpoint';
+import { getCheckpoint, setCheckpoint, getCursor, setCursor } from './checkpoint';
 import { decodeEventData, DecodedEvent } from './decoder';
+import { getRedisClient } from '../redis';
 import {
   registry,
   observedLedger,
@@ -86,13 +87,15 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
     const rawAmount = extractAmount(data);
     const rawProposalId = extractProposalId(data);
     await prisma.treasuryEvent.upsert({
-      where: { txHash: event.txHash },
+      where: { eventId: event.eventId },
       create: {
+        eventId: event.eventId,
         treasuryAddress: event.contractId,
         eventType: event.topic,
         address: extractAddress(data),
         amount: rawAmount !== null ? Number(rawAmount) : null,
         token: typeof data.token === 'string' ? data.token : null,
+        txHash: event.txHash,
         proposalId: rawProposalId !== null ? Number(rawProposalId) : null,
         metadata: data as Prisma.InputJsonValue,
       },
@@ -255,10 +258,16 @@ const processEvents = async (
 ): Promise<{ processed: number; quarantined: number }> => {
   let processed = 0;
   let quarantined = 0;
+  const redis = await getRedisClient();
 
   for (const event of events) {
     try {
+      const isProcessed = await redis.sIsMember('orbitpay:indexer:processed_events', event.eventId);
+      if (isProcessed) {
+        continue;
+      }
       await upsertEvent(event);
+      await redis.sAdd('orbitpay:indexer:processed_events', event.eventId);
       processed++;
     } catch (error) {
       decodeFailures.inc({ contract: event.contractId });
@@ -289,18 +298,29 @@ export const createIndexerEngine = () => {
       }
 
       try {
-        const checkpoint = await getCheckpoint();
-        const startLedger = checkpoint
-          ? checkpoint + 1
-          : config.indexer.startLedger > 0
-            ? config.indexer.startLedger
-            : undefined;
-
-        const response = await rpc.getEvents({
-          startLedger: startLedger as number,
+        const cursor = await getCursor();
+        let requestPayload: any = {
           filters: getContractFilters(),
           limit: config.indexer.batchSize,
-        });
+        };
+
+        let startLedger: number | undefined;
+        if (cursor) {
+          requestPayload.cursor = cursor;
+        } else {
+          const checkpoint = await getCheckpoint();
+          startLedger = checkpoint
+            ? checkpoint + 1
+            : config.indexer.startLedger > 0
+              ? config.indexer.startLedger
+              : undefined;
+              
+          if (startLedger) {
+            requestPayload.startLedger = startLedger;
+          }
+        }
+
+        const response = await rpc.getEvents(requestPayload);
 
         const latestLedger = response.latestLedger;
         observedLedger.set(latestLedger);
@@ -322,6 +342,10 @@ export const createIndexerEngine = () => {
           console.log(
             `Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined} quarantined`,
           );
+        }
+
+        if ((response as any).cursor) {
+          await setCursor((response as any).cursor);
         }
 
         await setCheckpoint(maxEventLedger);
