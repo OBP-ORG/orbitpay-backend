@@ -1,13 +1,13 @@
 /** @type {import('ts-jest').JestConfigWithTsJest} */
 module.exports = {
-  preset: 'ts-jest',
+  rootDir: 'C:/Users/TOSHIBA/orbitpay-backend',
   testEnvironment: 'node',
   testMatch: ['**/__tests__/**/*.test.ts'],
   testPathIgnorePatterns: ['/node_modules/', 'decimal-precision\\.test\\.ts'],
   transform: {
-    '^.+\\.tsx?$': ['ts-jest', { tsconfig: './tsconfig.test.json' }],
+    '^.+\\.tsx?$': [require.resolve('ts-jest'), { tsconfig: './tsconfig.test.json' }],
     // Transform ESM-only packages from @noble/* used transitively by @stellar/stellar-sdk
-    '^.+\\.js$': ['ts-jest', { tsconfig: './tsconfig.test.json', allowJs: true }],
+    '^.+\\.js$': [require.resolve('ts-jest'), { tsconfig: './tsconfig.test.json', allowJs: true }],
   },
   // Allow ts-jest to transform @noble/* and @scure/* (pure-ESM) instead of passing
   // them through to Node unchanged (which would fail because Jest runs in CJS mode).

@@ -79,13 +79,16 @@ const extractStreamId = (data: Record<string, unknown>): bigint | null => {
   return null;
 };
 
-const upsertEvent = async (event: DecodedEvent): Promise<void> => {
+const upsertEvent = async (
+  event: DecodedEvent,
+  tx: Prisma.TransactionClient,
+): Promise<void> => {
   const data = event.data;
 
   if (event.contractId === config.contracts.treasury) {
     const rawAmount = extractAmount(data);
     const rawProposalId = extractProposalId(data);
-    await prisma.treasuryEvent.upsert({
+    await tx.treasuryEvent.upsert({
       where: { txHash: event.txHash },
       create: {
         treasuryAddress: event.contractId,
@@ -105,7 +108,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
   if (event.contractId === config.contracts.payrollStream) {
     const streamId = extractStreamId(data);
     if (streamId === null && event.topic === 'StreamCreated') {
-      await quarantineEvent(event, 'StreamCreated event missing stream_id');
+      await quarantineEvent(event, 'StreamCreated event missing stream_id', tx);
       return;
     }
 
@@ -119,7 +122,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
         StreamClaimed: 'active',
       };
 
-      await prisma.stream.upsert({
+      await tx.stream.upsert({
         where: { contractStreamId: sid },
         create: {
           contractStreamId: sid,
@@ -140,13 +143,18 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       });
 
       if (event.topic === 'StreamClaimed') {
-        const existing = await prisma.stream.findUnique({
+        const existing = await tx.stream.findUnique({
           where: { contractStreamId: sid },
         });
         if (existing) {
-          await prisma.claimEvent.create({
-            data: {
+          await tx.claimEvent.upsert({
+            where: { txHash: event.txHash },
+            create: {
               streamId: existing.id,
+              amount: Number(extractAmount(data) ?? 0),
+              txHash: event.txHash,
+            },
+            update: {
               amount: Number(extractAmount(data) ?? 0),
             },
           });
@@ -166,7 +174,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       VestingFullyClaimed: 'completed',
     };
 
-    await prisma.vestingSchedule.upsert({
+    await tx.vestingSchedule.upsert({
       where: { id: scheduleId },
       create: {
         id: scheduleId,
@@ -193,7 +201,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       ProposalCancelled: 'cancelled',
     };
 
-    await prisma.proposal.upsert({
+    await tx.proposal.upsert({
       where: { id: proposalId },
       create: {
         id: proposalId,
@@ -208,7 +216,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
     if (event.topic === 'VoteCast') {
       const voterAddr = typeof data.voter === 'string' ? data.voter : '';
       const voteWeight = typeof data.weight === 'number' ? data.weight : 1;
-      await prisma.vote.upsert({
+      await tx.vote.upsert({
         where: { proposalId_voter: { proposalId, voter: voterAddr } },
         create: {
           proposalId,
@@ -229,6 +237,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
   await quarantineEvent(
     event,
     `unknown contract ${event.contractId} — not in configured contract registry`,
+    tx,
   );
   eventsProcessed.inc({ contract: 'unknown' });
 };
@@ -236,8 +245,9 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
 const quarantineEvent = async (
   event: DecodedEvent,
   error: string,
+  tx: Prisma.TransactionClient,
 ): Promise<void> => {
-  await prisma.deadLetterEvent.create({
+  await tx.deadLetterEvent.create({
     data: {
       eventId: event.eventId,
       ledger: event.ledger,
@@ -252,19 +262,28 @@ const quarantineEvent = async (
 
 const processEvents = async (
   events: DecodedEvent[],
+  tx: Prisma.TransactionClient,
+  attempt: number,
+  maxRetries: number,
 ): Promise<{ processed: number; quarantined: number }> => {
   let processed = 0;
   let quarantined = 0;
 
   for (const event of events) {
     try {
-      await upsertEvent(event);
+      await upsertEvent(event, tx);
       processed++;
     } catch (error) {
       decodeFailures.inc({ contract: event.contractId });
+      // If we are before the final attempt, throw the error out to trigger a rollback and retry
+      if (attempt < maxRetries - 1) {
+        throw error;
+      }
+      // On the final attempt, quarantine the event within the committed transaction
       await quarantineEvent(
         event,
         error instanceof Error ? error.message : 'Unknown error',
+        tx,
       );
       quarantined++;
     }
@@ -296,8 +315,14 @@ export const createIndexerEngine = () => {
             ? config.indexer.startLedger
             : undefined;
 
+        let endLedger: number | undefined = undefined;
+        if (startLedger) {
+          endLedger = startLedger + 10000;
+        }
+
         const response = await rpc.getEvents({
           startLedger: startLedger as number,
+          endLedger,
           filters: getContractFilters(),
           limit: config.indexer.batchSize,
         });
@@ -313,18 +338,28 @@ export const createIndexerEngine = () => {
           }
         }
 
+        const actualEndLedger = endLedger ? Math.min(endLedger, latestLedger) : latestLedger;
+
         const maxEventLedger = events.length > 0
           ? Math.max(...events.map((e) => e.ledger))
-          : startLedger ?? latestLedger;
+          : actualEndLedger;
 
-        if (events.length > 0) {
-          const { processed, quarantined } = await processEvents(events);
-          console.log(
-            `Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined} quarantined`,
-          );
-        }
+        // Atomic transaction wrapping event processing and checkpoint advance
+        await prisma.$transaction(async (tx) => {
+          if (events.length > 0) {
+            const { processed, quarantined } = await processEvents(
+              events,
+              tx,
+              attempt,
+              config.indexer.maxRetries,
+            );
+            console.log(
+              `Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined} quarantined`,
+            );
+          }
+          await setCheckpoint(maxEventLedger, tx);
+        });
 
-        await setCheckpoint(maxEventLedger);
         indexedLedger.set(maxEventLedger);
 
         if (maxEventLedger) {
