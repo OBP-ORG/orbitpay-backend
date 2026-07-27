@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from 'express';
 import { config } from '../config';
 import { getRedisClient } from '../lib/redis';
+import { logger } from '../lib/logger';
 
 interface RateLimitEntry {
   count: number;
@@ -10,6 +11,17 @@ interface RateLimitEntry {
 }
 
 const inMemoryEntries = new Map<string, RateLimitEntry>();
+
+const IN_MEMORY_CLEANUP_INTERVAL = 60_000;
+const inMemoryCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of inMemoryEntries) {
+    if (now - entry.windowStartedAt > config.rateLimit.windowMs * 2 && entry.blockedUntil < now) {
+      inMemoryEntries.delete(key);
+    }
+  }
+}, IN_MEMORY_CLEANUP_INTERVAL);
+if (inMemoryCleanupTimer.unref) inMemoryCleanupTimer.unref();
 
 const getClientIp = (req: Request): string => {
   const forwardedFor = req.headers['x-forwarded-for'];
@@ -30,6 +42,7 @@ const getKey = (req: Request): string => {
 const inMemoryRateLimit = (key: string): { allowed: boolean; retryAfter: number } => {
   const now = Date.now();
   const current = inMemoryEntries.get(key);
+  // Safe: Node.js single-threaded event loop prevents concurrent map mutations
 
   if (!current || now - current.windowStartedAt >= config.rateLimit.windowMs) {
     inMemoryEntries.set(key, {
@@ -54,7 +67,6 @@ const inMemoryRateLimit = (key: string): { allowed: boolean; retryAfter: number 
     return { allowed: false, retryAfter: Math.ceil(backoffMs / 1000) };
   }
 
-  inMemoryEntries.set(key, current);
   return { allowed: true, retryAfter: 0 };
 };
 
@@ -87,6 +99,7 @@ const redisRateLimit = async (key: string): Promise<{ allowed: boolean; retryAft
       if not window_start or (now - tonumber(window_start)) >= window_ms then
         redis.call('SET', window_key, now, 'PX', window_ms)
         redis.call('SET', count_key, 1, 'PX', window_ms)
+        redis.call('DEL', violations_key)
         return {1, 0}
       end
 
@@ -109,7 +122,8 @@ const redisRateLimit = async (key: string): Promise<{ allowed: boolean; retryAft
     const [allowed, backoffMs] = result as [number, number];
     if (allowed === 1) return { allowed: true, retryAfter: 0 };
     return { allowed: false, retryAfter: Math.ceil(backoffMs / 1000) };
-  } catch {
+  } catch (err) {
+    logger.warn(null, 'Redis rate limit failed, falling back to in-memory', { error: String(err) });
     return inMemoryRateLimit(key);
   }
 };

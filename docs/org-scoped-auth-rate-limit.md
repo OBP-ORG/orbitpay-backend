@@ -164,9 +164,10 @@ extensible to `walletAddress` for authenticated endpoints.
 ```
 1. Compute key (ip | walletAddress)
 2. If Redis is available:
-   a. MULTI/EXEC block to fetch or initialize window atomically
-   b. INCR count; if first in window, set window start + TTL
-   c. If count > maxRequests, record violation, compute backoff, return 429
+   a. Lua script for atomic window fetch-or-initialize
+   b. Count is INCR'd; if first in window, window + count keys set with TTL
+   c. Violations are DEL'd on window reset (fresh window = fresh backoff)
+   d. If count > maxRequests, record violation, compute backoff, return 429
 3. If Redis is unavailable:
    a. Fall back to in-memory map (current behavior)
 4. Exponential backoff:
@@ -185,6 +186,7 @@ local window = redis.call('GET', key .. ':window')
 if not window or (now - tonumber(window)) >= windowMs then
   redis.call('SET', key .. ':window', now, 'PX', windowMs)
   redis.call('SET', key .. ':count', 1, 'PX', windowMs)
+  redis.call('DEL', key .. ':violations')
   return {1, 0}
 end
 
@@ -227,11 +229,11 @@ in-memory without rejecting traffic.
 ```typescript
 // Added to src/config.ts
 rateLimit: {
-  maxRequests: number,      // existing
-  windowMs: number,         // existing
-  backoffBaseMs: number,    // existing
-  strategy: 'ip' | 'wallet', // new — default 'ip'
-  useRedis: boolean,         // new — default true
+  maxRequests: number,          // existing — env var RATE_LIMIT_MAX_REQUESTS
+  windowMs: number,             // existing — env var RATE_LIMIT_WINDOW_SECONDS (configured in seconds, stored as ms)
+  backoffBaseMs: number,        // existing — env var RATE_LIMIT_BACKOFF_BASE_SECONDS (configured in seconds, stored as ms)
+  strategy: 'ip' | 'wallet',    // new — env var RATE_LIMIT_STRATEGY, default 'ip'
+  useRedis: boolean,            // new — env var RATE_LIMIT_USE_REDIS, default true
 }
 ```
 
