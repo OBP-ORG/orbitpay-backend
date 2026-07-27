@@ -1,5 +1,5 @@
 import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
-import { Prisma } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { config } from '../../config';
 import { prisma } from '../prisma';
 import { getCheckpoint, setCheckpoint } from './checkpoint';
@@ -79,13 +79,25 @@ const extractStreamId = (data: Record<string, unknown>): bigint | null => {
   return null;
 };
 
-const upsertEvent = async (event: DecodedEvent): Promise<void> => {
+type TxPrisma = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
+
+class QuarantineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'QuarantineError';
+  }
+}
+
+const upsertEvent = async (
+  event: DecodedEvent,
+  tx: TxPrisma = prisma,
+): Promise<void> => {
   const data = event.data;
 
   if (event.contractId === config.contracts.treasury) {
     const rawAmount = extractAmount(data);
     const rawProposalId = extractProposalId(data);
-    await prisma.treasuryEvent.upsert({
+    await tx.treasuryEvent.upsert({
       where: { txHash: event.txHash },
       create: {
         treasuryAddress: event.contractId,
@@ -105,8 +117,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
   if (event.contractId === config.contracts.payrollStream) {
     const streamId = extractStreamId(data);
     if (streamId === null && event.topic === 'StreamCreated') {
-      await quarantineEvent(event, 'StreamCreated event missing stream_id');
-      return;
+      throw new QuarantineError('StreamCreated event missing stream_id');
     }
 
     if (['StreamCreated', 'StreamClaimed', 'StreamCancelled', 'StreamPaused', 'StreamResumed'].includes(event.topic)) {
@@ -119,7 +130,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
         StreamClaimed: 'active',
       };
 
-      await prisma.stream.upsert({
+      await tx.stream.upsert({
         where: { contractStreamId: sid },
         create: {
           contractStreamId: sid,
@@ -140,13 +151,23 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       });
 
       if (event.topic === 'StreamClaimed') {
-        const existing = await prisma.stream.findUnique({
+        const existing = await tx.stream.findUnique({
           where: { contractStreamId: sid },
         });
         if (existing) {
-          await prisma.claimEvent.create({
-            data: {
+          await tx.claimEvent.upsert({
+            where: {
+              streamId_txHash: {
+                streamId: existing.id,
+                txHash: event.txHash,
+              },
+            },
+            create: {
               streamId: existing.id,
+              amount: Number(extractAmount(data) ?? 0),
+              txHash: event.txHash,
+            },
+            update: {
               amount: Number(extractAmount(data) ?? 0),
             },
           });
@@ -166,7 +187,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       VestingFullyClaimed: 'completed',
     };
 
-    await prisma.vestingSchedule.upsert({
+    await tx.vestingSchedule.upsert({
       where: { id: scheduleId },
       create: {
         id: scheduleId,
@@ -193,7 +214,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       ProposalCancelled: 'cancelled',
     };
 
-    await prisma.proposal.upsert({
+    await tx.proposal.upsert({
       where: { id: proposalId },
       create: {
         id: proposalId,
@@ -208,7 +229,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
     if (event.topic === 'VoteCast') {
       const voterAddr = typeof data.voter === 'string' ? data.voter : '';
       const voteWeight = typeof data.weight === 'number' ? data.weight : 1;
-      await prisma.vote.upsert({
+      await tx.vote.upsert({
         where: { proposalId_voter: { proposalId, voter: voterAddr } },
         create: {
           proposalId,
@@ -226,8 +247,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
     return;
   }
 
-  await quarantineEvent(
-    event,
+  throw new QuarantineError(
     `unknown contract ${event.contractId} — not in configured contract registry`,
   );
   eventsProcessed.inc({ contract: 'unknown' });
@@ -236,8 +256,9 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
 const quarantineEvent = async (
   event: DecodedEvent,
   error: string,
+  tx: TxPrisma = prisma,
 ): Promise<void> => {
-  await prisma.deadLetterEvent.create({
+  await tx.deadLetterEvent.create({
     data: {
       eventId: event.eventId,
       ledger: event.ledger,
@@ -250,27 +271,45 @@ const quarantineEvent = async (
   });
 };
 
-const processEvents = async (
+type ProcessResult = {
+  processed: number;
+  quarantined: number;
+  quarantinedLedgers: Set<number>;
+};
+
+const processEventsInTransaction = async (
   events: DecodedEvent[],
-): Promise<{ processed: number; quarantined: number }> => {
-  let processed = 0;
-  let quarantined = 0;
+): Promise<ProcessResult> => {
+  const quarantinedLedgers = new Set<number>();
 
-  for (const event of events) {
-    try {
-      await upsertEvent(event);
-      processed++;
-    } catch (error) {
-      decodeFailures.inc({ contract: event.contractId });
-      await quarantineEvent(
-        event,
-        error instanceof Error ? error.message : 'Unknown error',
-      );
-      quarantined++;
+  const result = await prisma.$transaction(async (tx) => {
+    let processed = 0;
+    let quarantined = 0;
+
+    for (const event of events) {
+      try {
+        await upsertEvent(event, tx);
+        processed++;
+      } catch (error) {
+        decodeFailures.inc({ contract: event.contractId });
+        if (error instanceof QuarantineError) {
+          await quarantineEvent(event, error.message, tx);
+        } else {
+          await quarantineEvent(
+            event,
+            error instanceof Error ? error.message : 'Unknown error',
+            tx,
+          );
+        }
+        quarantinedLedgers.add(event.ledger);
+        quarantined++;
+      }
     }
-  }
 
-  return { processed, quarantined };
+    return { processed, quarantined };
+  });
+
+  return { ...result, quarantinedLedgers };
 };
 
 export const createIndexerEngine = () => {
@@ -313,26 +352,52 @@ export const createIndexerEngine = () => {
           }
         }
 
-        const maxEventLedger = events.length > 0
-          ? Math.max(...events.map((e) => e.ledger))
-          : startLedger ?? latestLedger;
-
         if (events.length > 0) {
-          const { processed, quarantined } = await processEvents(events);
+          const { processed, quarantined, quarantinedLedgers } =
+            await processEventsInTransaction(events);
+
+          const appliedEvents = events.filter(
+            (e) => !quarantinedLedgers.has(e.ledger),
+          );
+          const maxAppliedLedger =
+            appliedEvents.length > 0
+              ? Math.max(...appliedEvents.map((e) => e.ledger))
+              : Math.min(...events.map((e) => e.ledger));
+
+          await setCheckpoint(maxAppliedLedger);
+          indexedLedger.set(maxAppliedLedger);
+
+          if (maxAppliedLedger) {
+            const lag = Math.max(0, (latestLedger - maxAppliedLedger) * 5);
+            lagSeconds.set(lag);
+          }
+
+          state.currentLedger = maxAppliedLedger;
+
           console.log(
             `Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined} quarantined`,
           );
+        } else if (startLedger !== undefined) {
+          await setCheckpoint(startLedger);
+          indexedLedger.set(startLedger);
+
+          if (startLedger) {
+            const lag = Math.max(0, (latestLedger - startLedger) * 5);
+            lagSeconds.set(lag);
+          }
+
+          state.currentLedger = startLedger;
+        } else {
+          indexedLedger.set(latestLedger);
+
+          if (latestLedger) {
+            const lag = 0;
+            lagSeconds.set(lag);
+          }
+
+          state.currentLedger = latestLedger;
         }
 
-        await setCheckpoint(maxEventLedger);
-        indexedLedger.set(maxEventLedger);
-
-        if (maxEventLedger) {
-          const lag = Math.max(0, (latestLedger - maxEventLedger) * 5);
-          lagSeconds.set(lag);
-        }
-
-        state.currentLedger = maxEventLedger;
         state.lastSuccessfulPollAt = new Date().toISOString();
         state.lastError = null;
         return;
@@ -367,5 +432,5 @@ export const createIndexerEngine = () => {
     return registry.metrics();
   };
 
-  return { start, stop, getMetrics, getState: () => ({ ...state }) };
+  return { start, stop, poll, getMetrics, getState: () => ({ ...state }) };
 };
