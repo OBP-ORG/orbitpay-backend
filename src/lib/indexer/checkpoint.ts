@@ -1,14 +1,8 @@
-import { getRedisClient } from '../redis';
-
-const CHECKPOINT_KEY = 'orbitpay:indexer:checkpoint';
+import { prisma } from '../prisma';
 
 export const getCheckpoint = async (): Promise<number | null> => {
-  const redis = await getRedisClient();
-  const value = await redis.get(CHECKPOINT_KEY);
-  return value ? Number(value) : null;
-};
-
-export const setCheckpoint = async (ledger: number): Promise<void> => {
-  const redis = await getRedisClient();
-  await redis.set(CHECKPOINT_KEY, String(ledger));
+  const state = await prisma.indexerState.findUnique({
+    where: { id: 'singleton' }
+  });
+  return state ? state.lastLedger : null;
 };
