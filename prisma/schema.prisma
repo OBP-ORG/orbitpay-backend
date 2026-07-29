@@ -139,3 +139,11 @@ model DeadLetterEvent {
   @@index([ledger, txHash])
   @@map("dead_letter_events")
 }
+
+model IndexerState {
+  id          String   @id @default("singleton")
+  lastLedger  Int      @map("last_ledger")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("indexer_state")
+}

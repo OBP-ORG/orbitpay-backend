@@ -2,7 +2,7 @@ import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { config } from '../../config';
 import { prisma } from '../prisma';
-import { getCheckpoint, setCheckpoint } from './checkpoint';
+import { getCheckpoint } from './checkpoint';
 import { decodeEventData, DecodedEvent } from './decoder';
 import {
   registry,
@@ -275,10 +275,12 @@ type ProcessResult = {
   processed: number;
   quarantined: number;
   quarantinedLedgers: Set<number>;
+  maxAppliedLedger: number;
 };
 
 const processEventsInTransaction = async (
   events: DecodedEvent[],
+  startLedger?: number,
 ): Promise<ProcessResult> => {
   const quarantinedLedgers = new Set<number>();
 
@@ -306,7 +308,20 @@ const processEventsInTransaction = async (
       }
     }
 
-    return { processed, quarantined };
+    const appliedEvents = events.filter((e) => !quarantinedLedgers.has(e.ledger));
+    const maxAppliedLedger = appliedEvents.length > 0
+      ? Math.max(...appliedEvents.map((e) => e.ledger))
+      : (events.length > 0 ? Math.min(...events.map((e) => e.ledger)) : (startLedger ?? 0));
+
+    if (maxAppliedLedger) {
+      await tx.indexerState.upsert({
+        where: { id: 'singleton' },
+        create: { id: 'singleton', lastLedger: maxAppliedLedger },
+        update: { lastLedger: maxAppliedLedger }
+      });
+    }
+
+    return { processed, quarantined, maxAppliedLedger };
   });
 
   return { ...result, quarantinedLedgers };
@@ -353,18 +368,9 @@ export const createIndexerEngine = () => {
         }
 
         if (events.length > 0) {
-          const { processed, quarantined, quarantinedLedgers } =
-            await processEventsInTransaction(events);
+          const { processed, quarantined, maxAppliedLedger } =
+            await processEventsInTransaction(events, startLedger);
 
-          const appliedEvents = events.filter(
-            (e) => !quarantinedLedgers.has(e.ledger),
-          );
-          const maxAppliedLedger =
-            appliedEvents.length > 0
-              ? Math.max(...appliedEvents.map((e) => e.ledger))
-              : Math.min(...events.map((e) => e.ledger));
-
-          await setCheckpoint(maxAppliedLedger);
           indexedLedger.set(maxAppliedLedger);
 
           if (maxAppliedLedger) {
@@ -378,7 +384,11 @@ export const createIndexerEngine = () => {
             `Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined} quarantined`,
           );
         } else if (startLedger !== undefined) {
-          await setCheckpoint(startLedger);
+          await prisma.indexerState.upsert({
+            where: { id: 'singleton' },
+            create: { id: 'singleton', lastLedger: startLedger },
+            update: { lastLedger: startLedger }
+          });
           indexedLedger.set(startLedger);
 
           if (startLedger) {
@@ -388,6 +398,11 @@ export const createIndexerEngine = () => {
 
           state.currentLedger = startLedger;
         } else {
+          await prisma.indexerState.upsert({
+            where: { id: 'singleton' },
+            create: { id: 'singleton', lastLedger: latestLedger },
+            update: { lastLedger: latestLedger }
+          });
           indexedLedger.set(latestLedger);
 
           if (latestLedger) {
