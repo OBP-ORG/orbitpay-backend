@@ -97,8 +97,10 @@ model ClaimEvent {
   streamId  String   @map("stream_id")
   stream    Stream   @relation(fields: [streamId], references: [id], onDelete: Cascade)
   amount    Decimal  @db.Decimal(36, 7)
+  txHash    String?  @map("tx_hash")
   timestamp DateTime @default(now())
 
+  @@unique([streamId, txHash])
   @@index([streamId, timestamp])
   @@map("claim_events")
 }
@@ -137,4 +139,12 @@ model DeadLetterEvent {
 
   @@index([ledger, txHash])
   @@map("dead_letter_events")
+}
+
+model IndexerState {
+  id          String   @id @default("singleton")
+  lastLedger  Int      @map("last_ledger")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("indexer_state")
 }

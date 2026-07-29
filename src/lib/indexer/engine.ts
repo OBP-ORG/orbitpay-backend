@@ -1,8 +1,8 @@
 import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
-import { Prisma } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { config } from '../../config';
 import { prisma } from '../prisma';
-import { getCheckpoint, setCheckpoint, getCursor, setCursor } from './checkpoint';
+import { getCheckpoint, getCursor, setCursor } from './checkpoint';
 import { decodeEventData, DecodedEvent } from './decoder';
 import { getRedisClient } from '../redis';
 import {
@@ -80,13 +80,25 @@ const extractStreamId = (data: Record<string, unknown>): bigint | null => {
   return null;
 };
 
-const upsertEvent = async (event: DecodedEvent): Promise<void> => {
+type TxPrisma = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
+
+class QuarantineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'QuarantineError';
+  }
+}
+
+const upsertEvent = async (
+  event: DecodedEvent,
+  tx: TxPrisma = prisma,
+): Promise<void> => {
   const data = event.data;
 
   if (event.contractId === config.contracts.treasury) {
     const rawAmount = extractAmount(data);
     const rawProposalId = extractProposalId(data);
-    await prisma.treasuryEvent.upsert({
+    await tx.treasuryEvent.upsert({
       where: { eventId: event.eventId },
       create: {
         eventId: event.eventId,
@@ -108,8 +120,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
   if (event.contractId === config.contracts.payrollStream) {
     const streamId = extractStreamId(data);
     if (streamId === null && event.topic === 'StreamCreated') {
-      await quarantineEvent(event, 'StreamCreated event missing stream_id');
-      return;
+      throw new QuarantineError('StreamCreated event missing stream_id');
     }
 
     if (['StreamCreated', 'StreamClaimed', 'StreamCancelled', 'StreamPaused', 'StreamResumed'].includes(event.topic)) {
@@ -122,7 +133,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
         StreamClaimed: 'active',
       };
 
-      await prisma.stream.upsert({
+      await tx.stream.upsert({
         where: { contractStreamId: sid },
         create: {
           contractStreamId: sid,
@@ -143,13 +154,23 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       });
 
       if (event.topic === 'StreamClaimed') {
-        const existing = await prisma.stream.findUnique({
+        const existing = await tx.stream.findUnique({
           where: { contractStreamId: sid },
         });
         if (existing) {
-          await prisma.claimEvent.create({
-            data: {
+          await tx.claimEvent.upsert({
+            where: {
+              streamId_txHash: {
+                streamId: existing.id,
+                txHash: event.txHash,
+              },
+            },
+            create: {
               streamId: existing.id,
+              amount: Number(extractAmount(data) ?? 0),
+              txHash: event.txHash,
+            },
+            update: {
               amount: Number(extractAmount(data) ?? 0),
             },
           });
@@ -169,7 +190,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       VestingFullyClaimed: 'completed',
     };
 
-    await prisma.vestingSchedule.upsert({
+    await tx.vestingSchedule.upsert({
       where: { id: scheduleId },
       create: {
         id: scheduleId,
@@ -196,7 +217,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
       ProposalCancelled: 'cancelled',
     };
 
-    await prisma.proposal.upsert({
+    await tx.proposal.upsert({
       where: { id: proposalId },
       create: {
         id: proposalId,
@@ -211,7 +232,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
     if (event.topic === 'VoteCast') {
       const voterAddr = typeof data.voter === 'string' ? data.voter : '';
       const voteWeight = typeof data.weight === 'number' ? data.weight : 1;
-      await prisma.vote.upsert({
+      await tx.vote.upsert({
         where: { proposalId_voter: { proposalId, voter: voterAddr } },
         create: {
           proposalId,
@@ -229,8 +250,7 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
     return;
   }
 
-  await quarantineEvent(
-    event,
+  throw new QuarantineError(
     `unknown contract ${event.contractId} — not in configured contract registry`,
   );
   eventsProcessed.inc({ contract: 'unknown' });
@@ -239,8 +259,9 @@ const upsertEvent = async (event: DecodedEvent): Promise<void> => {
 const quarantineEvent = async (
   event: DecodedEvent,
   error: string,
+  tx: TxPrisma = prisma,
 ): Promise<void> => {
-  await prisma.deadLetterEvent.create({
+  await tx.deadLetterEvent.create({
     data: {
       eventId: event.eventId,
       ledger: event.ledger,
@@ -253,33 +274,67 @@ const quarantineEvent = async (
   });
 };
 
-const processEvents = async (
+type ProcessResult = {
+  processed: number;
+  quarantined: number;
+  quarantinedLedgers: Set<number>;
+  maxAppliedLedger: number;
+};
+
+const processEventsInTransaction = async (
   events: DecodedEvent[],
-): Promise<{ processed: number; quarantined: number }> => {
-  let processed = 0;
-  let quarantined = 0;
+  startLedger?: number,
+): Promise<ProcessResult> => {
+  const quarantinedLedgers = new Set<number>();
   const redis = await getRedisClient();
 
-  for (const event of events) {
-    try {
-      const isProcessed = await redis.sIsMember('orbitpay:indexer:processed_events', event.eventId);
-      if (isProcessed) {
-        continue;
-      }
-      await upsertEvent(event);
-      await redis.sAdd('orbitpay:indexer:processed_events', event.eventId);
-      processed++;
-    } catch (error) {
-      decodeFailures.inc({ contract: event.contractId });
-      await quarantineEvent(
-        event,
-        error instanceof Error ? error.message : 'Unknown error',
-      );
-      quarantined++;
-    }
-  }
+  const result = await prisma.$transaction(async (tx) => {
+    let processed = 0;
+    let quarantined = 0;
 
-  return { processed, quarantined };
+    for (const event of events) {
+      try {
+        const isProcessed = await redis.sIsMember('orbitpay:indexer:processed_events', event.eventId);
+        if (isProcessed) {
+          continue;
+        }
+        await upsertEvent(event, tx);
+        await redis.sAdd('orbitpay:indexer:processed_events', event.eventId);
+        await redis.expire('orbitpay:indexer:processed_events', 7 * 24 * 60 * 60); // 7 days TTL
+        processed++;
+      } catch (error) {
+        decodeFailures.inc({ contract: event.contractId });
+        if (error instanceof QuarantineError) {
+          await quarantineEvent(event, error.message, tx);
+        } else {
+          await quarantineEvent(
+            event,
+            error instanceof Error ? error.message : 'Unknown error',
+            tx,
+          );
+        }
+        quarantinedLedgers.add(event.ledger);
+        quarantined++;
+      }
+    }
+
+    const appliedEvents = events.filter((e) => !quarantinedLedgers.has(e.ledger));
+    const maxAppliedLedger = appliedEvents.length > 0
+      ? Math.max(...appliedEvents.map((e) => e.ledger))
+      : (events.length > 0 ? Math.min(...events.map((e) => e.ledger)) : (startLedger ?? 0));
+
+    if (maxAppliedLedger) {
+      await tx.indexerState.upsert({
+        where: { id: 'singleton' },
+        create: { id: 'singleton', lastLedger: maxAppliedLedger },
+        update: { lastLedger: maxAppliedLedger }
+      });
+    }
+
+    return { processed, quarantined, maxAppliedLedger };
+  });
+
+  return { ...result, quarantinedLedgers };
 };
 
 export const createIndexerEngine = () => {
@@ -333,30 +388,56 @@ export const createIndexerEngine = () => {
           }
         }
 
-        const maxEventLedger = events.length > 0
-          ? Math.max(...events.map((e) => e.ledger))
-          : startLedger ?? latestLedger;
-
         if (events.length > 0) {
-          const { processed, quarantined } = await processEvents(events);
+          const { processed, quarantined, maxAppliedLedger } =
+            await processEventsInTransaction(events, startLedger);
+
+          indexedLedger.set(maxAppliedLedger);
+
+          if (maxAppliedLedger) {
+            const lag = Math.max(0, (latestLedger - maxAppliedLedger) * 5);
+            lagSeconds.set(lag);
+          }
+
+          state.currentLedger = maxAppliedLedger;
+
           console.log(
             `Indexed ledger ${startLedger ?? 'latest'}: ${processed} events, ${quarantined} quarantined`,
           );
+        } else if (startLedger !== undefined) {
+          await prisma.indexerState.upsert({
+            where: { id: 'singleton' },
+            create: { id: 'singleton', lastLedger: startLedger },
+            update: { lastLedger: startLedger }
+          });
+          indexedLedger.set(startLedger);
+
+          if (startLedger) {
+            const lag = Math.max(0, (latestLedger - startLedger) * 5);
+            lagSeconds.set(lag);
+          }
+
+          state.currentLedger = startLedger;
+        } else {
+          await prisma.indexerState.upsert({
+            where: { id: 'singleton' },
+            create: { id: 'singleton', lastLedger: latestLedger },
+            update: { lastLedger: latestLedger }
+          });
+          indexedLedger.set(latestLedger);
+
+          if (latestLedger) {
+            const lag = 0;
+            lagSeconds.set(lag);
+          }
+
+          state.currentLedger = latestLedger;
         }
 
-        if ((response as any).cursor) {
-          await setCursor((response as any).cursor);
+        const cursorRes = response as SorobanRpc.Api.GetEventsResponse & { cursor?: string };
+        if (cursorRes.cursor) {
+          await setCursor(cursorRes.cursor);
         }
-
-        await setCheckpoint(maxEventLedger);
-        indexedLedger.set(maxEventLedger);
-
-        if (maxEventLedger) {
-          const lag = Math.max(0, (latestLedger - maxEventLedger) * 5);
-          lagSeconds.set(lag);
-        }
-
-        state.currentLedger = maxEventLedger;
         state.lastSuccessfulPollAt = new Date().toISOString();
         state.lastError = null;
         return;
@@ -391,5 +472,5 @@ export const createIndexerEngine = () => {
     return registry.metrics();
   };
 
-  return { start, stop, getMetrics, getState: () => ({ ...state }) };
+  return { start, stop, poll, getMetrics, getState: () => ({ ...state }) };
 };

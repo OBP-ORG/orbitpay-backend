@@ -2,17 +2,34 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const prisma_1 = require("../lib/prisma");
+const logger_1 = require("../lib/logger");
+const validate_1 = require("../middleware/validate");
 const router = (0, express_1.Router)();
-router.get('/', async (req, res) => {
+router.get('/', async (req, res, next) => {
     try {
-        const proposals = await prisma_1.prisma.proposal.findMany();
-        res.json(proposals);
+        const pagination = (0, validate_1.parsePagePagination)(req, res);
+        if (!pagination)
+            return;
+        const { page, limitNum } = pagination;
+        const [proposals, total] = await Promise.all([
+            prisma_1.prisma.proposal.findMany({
+                skip: (page - 1) * limitNum,
+                take: limitNum,
+                orderBy: { createdAt: 'desc' },
+            }),
+            prisma_1.prisma.proposal.count(),
+        ]);
+        res.json({
+            data: proposals,
+            meta: { total, page, limit: limitNum, totalPages: Math.ceil(total / limitNum) },
+        });
     }
     catch (error) {
-        res.status(500).json({ error: 'Internal server error' });
+        logger_1.logger.error(req, 'Error fetching proposals', error);
+        next(error);
     }
 });
-router.get('/:id', async (req, res) => {
+router.get('/:id', async (req, res, next) => {
     try {
         const { id } = req.params;
         const proposal = await prisma_1.prisma.proposal.findUnique({
@@ -20,40 +37,44 @@ router.get('/:id', async (req, res) => {
             include: { votes: true },
         });
         if (!proposal) {
-            return res.status(404).json({ error: 'Proposal not found' });
+            res.status(404).json({
+                error: 'Not Found',
+                message: 'Proposal not found',
+                requestId: req.requestId,
+            });
+            return;
         }
         res.json(proposal);
     }
     catch (error) {
-        res.status(500).json({ error: 'Internal server error' });
+        logger_1.logger.error(req, 'Error fetching proposal', error);
+        next(error);
     }
 });
-router.get('/:id/votes', async (req, res) => {
+router.get('/:id/votes', async (req, res, next) => {
     try {
         const { id } = req.params;
-        const { page = '1', limit = '10' } = req.query;
-        const pageNumber = parseInt(String(page), 10);
-        const limitNumber = parseInt(String(limit), 10);
-        const skip = (pageNumber - 1) * limitNumber;
-        const votes = await prisma_1.prisma.vote.findMany({
-            where: { proposalId: id },
-            skip,
-            take: limitNumber,
-            orderBy: { createdAt: 'desc' },
-        });
-        const total = await prisma_1.prisma.vote.count({ where: { proposalId: id } });
+        const pagination = (0, validate_1.parsePagePagination)(req, res);
+        if (!pagination)
+            return;
+        const { page, limitNum } = pagination;
+        const [votes, total] = await Promise.all([
+            prisma_1.prisma.vote.findMany({
+                where: { proposalId: id },
+                skip: (page - 1) * limitNum,
+                take: limitNum,
+                orderBy: { createdAt: 'desc' },
+            }),
+            prisma_1.prisma.vote.count({ where: { proposalId: id } }),
+        ]);
         res.json({
             data: votes,
-            meta: {
-                total,
-                page: pageNumber,
-                limit: limitNumber,
-                totalPages: Math.ceil(total / limitNumber),
-            }
+            meta: { total, page, limit: limitNum, totalPages: Math.ceil(total / limitNum) },
         });
     }
     catch (error) {
-        res.status(500).json({ error: 'Internal server error' });
+        logger_1.logger.error(req, 'Error fetching votes', error);
+        next(error);
     }
 });
 exports.default = router;

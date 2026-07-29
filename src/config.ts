@@ -26,6 +26,8 @@ export const config = {
     windowMs: toNumber(process.env.RATE_LIMIT_WINDOW_SECONDS, 60) * 1000,
     backoffBaseMs:
       toNumber(process.env.RATE_LIMIT_BACKOFF_BASE_SECONDS, 60) * 1000,
+    useRedis: process.env.RATE_LIMIT_USE_REDIS !== 'false',
+    strategy: (process.env.RATE_LIMIT_STRATEGY === 'wallet' ? 'wallet' : 'ip') as 'ip' | 'wallet',
   },
   stellar: {
     rpcUrl: process.env.STELLAR_RPC_URL ?? 'https://soroban-testnet.stellar.org',

@@ -1,50 +1,64 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
+const client_1 = require("@prisma/client");
 const prisma_1 = require("../lib/prisma");
+const logger_1 = require("../lib/logger");
+const validate_1 = require("../middleware/validate");
 const router = (0, express_1.Router)();
-router.get('/', async (req, res) => {
+router.get('/', async (req, res, next) => {
     try {
         const { beneficiary } = req.query;
         if (!beneficiary) {
-            return res.status(400).json({ error: 'beneficiary query parameter is required' });
+            res.status(400).json({
+                error: 'Bad Request',
+                message: 'beneficiary query parameter is required',
+                requestId: req.requestId,
+            });
+            return;
         }
+        if (!(0, validate_1.requireStellarAddress)(String(beneficiary), 'beneficiary', req, res))
+            return;
         const schedules = await prisma_1.prisma.vestingSchedule.findMany({
             where: { beneficiary: String(beneficiary) },
         });
         res.json(schedules);
     }
     catch (error) {
-        res.status(500).json({ error: 'Internal server error' });
+        logger_1.logger.error(req, 'Error fetching vesting schedules', error);
+        next(error);
     }
 });
-router.get('/:id/progress', async (req, res) => {
+router.get('/:id/progress', async (req, res, next) => {
     try {
         const { id } = req.params;
-        const schedule = await prisma_1.prisma.vestingSchedule.findUnique({
-            where: { id },
-        });
+        const schedule = await prisma_1.prisma.vestingSchedule.findUnique({ where: { id: String(id) } });
         if (!schedule) {
-            return res.status(404).json({ error: 'Vesting schedule not found' });
+            res.status(404).json({
+                error: 'Not Found',
+                message: 'Vesting schedule not found',
+                requestId: req.requestId,
+            });
+            return;
         }
         const now = new Date();
         const totalDuration = schedule.endTime.getTime() - schedule.startTime.getTime();
         const elapsed = now.getTime() - schedule.startTime.getTime();
-        let progress = elapsed / totalDuration;
-        if (progress < 0)
-            progress = 0;
-        if (progress > 1)
-            progress = 1;
-        const vestedAmount = schedule.amount * progress;
+        // progress is a display ratio (0–1), not a stored value — floating-point is fine here
+        const progress = Math.min(1, Math.max(0, totalDuration > 0 ? elapsed / totalDuration : 0));
+        // Multiply using Decimal to avoid floating-point error in the accounting result
+        const vestedAmount = schedule.amount.mul(new client_1.Prisma.Decimal(progress));
+        // Amounts serialised as strings to prevent JSON precision loss
         res.json({
             scheduleId: id,
-            totalAmount: schedule.amount,
-            vestedAmount: vestedAmount,
+            totalAmount: schedule.amount.toFixed(),
+            vestedAmount: vestedAmount.toFixed(),
             progressPercentage: progress * 100,
         });
     }
     catch (error) {
-        res.status(500).json({ error: 'Internal server error' });
+        logger_1.logger.error(req, 'Error fetching vesting progress', error);
+        next(error);
     }
 });
 exports.default = router;
