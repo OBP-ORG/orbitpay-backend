@@ -2,8 +2,9 @@ import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { config } from '../../config';
 import { prisma } from '../prisma';
-import { getCheckpoint } from './checkpoint';
+import { getCheckpoint, getCursor, setCursor } from './checkpoint';
 import { decodeEventData, DecodedEvent } from './decoder';
+import { getRedisClient } from '../redis';
 import {
   registry,
   observedLedger,
@@ -98,13 +99,15 @@ const upsertEvent = async (
     const rawAmount = extractAmount(data);
     const rawProposalId = extractProposalId(data);
     await tx.treasuryEvent.upsert({
-      where: { txHash: event.txHash },
+      where: { eventId: event.eventId },
       create: {
+        eventId: event.eventId,
         treasuryAddress: event.contractId,
         eventType: event.topic,
         address: extractAddress(data),
         amount: rawAmount !== null ? Number(rawAmount) : null,
         token: typeof data.token === 'string' ? data.token : null,
+        txHash: event.txHash,
         proposalId: rawProposalId !== null ? Number(rawProposalId) : null,
         metadata: data as Prisma.InputJsonValue,
       },
@@ -283,6 +286,7 @@ const processEventsInTransaction = async (
   startLedger?: number,
 ): Promise<ProcessResult> => {
   const quarantinedLedgers = new Set<number>();
+  const redis = await getRedisClient();
 
   const result = await prisma.$transaction(async (tx) => {
     let processed = 0;
@@ -290,7 +294,13 @@ const processEventsInTransaction = async (
 
     for (const event of events) {
       try {
+        const isProcessed = await redis.sIsMember('orbitpay:indexer:processed_events', event.eventId);
+        if (isProcessed) {
+          continue;
+        }
         await upsertEvent(event, tx);
+        await redis.sAdd('orbitpay:indexer:processed_events', event.eventId);
+        await redis.expire('orbitpay:indexer:processed_events', 7 * 24 * 60 * 60); // 7 days TTL
         processed++;
       } catch (error) {
         decodeFailures.inc({ contract: event.contractId });
@@ -343,18 +353,29 @@ export const createIndexerEngine = () => {
       }
 
       try {
-        const checkpoint = await getCheckpoint();
-        const startLedger = checkpoint
-          ? checkpoint + 1
-          : config.indexer.startLedger > 0
-            ? config.indexer.startLedger
-            : undefined;
-
-        const response = await rpc.getEvents({
-          startLedger: startLedger as number,
+        const cursor = await getCursor();
+        let requestPayload: any = {
           filters: getContractFilters(),
           limit: config.indexer.batchSize,
-        });
+        };
+
+        let startLedger: number | undefined;
+        if (cursor) {
+          requestPayload.cursor = cursor;
+        } else {
+          const checkpoint = await getCheckpoint();
+          startLedger = checkpoint
+            ? checkpoint + 1
+            : config.indexer.startLedger > 0
+              ? config.indexer.startLedger
+              : undefined;
+              
+          if (startLedger) {
+            requestPayload.startLedger = startLedger;
+          }
+        }
+
+        const response = await rpc.getEvents(requestPayload);
 
         const latestLedger = response.latestLedger;
         observedLedger.set(latestLedger);
@@ -413,6 +434,10 @@ export const createIndexerEngine = () => {
           state.currentLedger = latestLedger;
         }
 
+        const cursorRes = response as SorobanRpc.Api.GetEventsResponse & { cursor?: string };
+        if (cursorRes.cursor) {
+          await setCursor(cursorRes.cursor);
+        }
         state.lastSuccessfulPollAt = new Date().toISOString();
         state.lastError = null;
         return;

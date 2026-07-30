@@ -46,7 +46,7 @@ export const decodeEventData = (
       ? Math.floor(new Date(String(event.ledgerClosedAt)).getTime() / 1000)
       : Math.floor(Date.now() / 1000);
 
-    const eventId = `ev-${ledger}-${txHash}`;
+    const eventId = (event as any).id ?? `ev-${ledger}-${txHash}`;
 
     return { eventId, ledger, txHash, contractId, topic, data, timestamp };
   } catch {

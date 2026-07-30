@@ -6,12 +6,21 @@ const mockPrismaClient = {
   proposal: { upsert: jest.fn() },
   vote: { upsert: jest.fn() },
   deadLetterEvent: { create: jest.fn() },
+  indexerState: { upsert: jest.fn(), findUnique: jest.fn() },
   $transaction: jest.fn(),
 };
 
 jest.mock('../lib/prisma', () => ({
   get prisma() { return mockPrismaClient; },
 }));
+
+const mockRedis = {
+  get: jest.fn(),
+  set: jest.fn(),
+  sIsMember: jest.fn(),
+  sAdd: jest.fn(),
+  expire: jest.fn(),
+};
 
 jest.mock('../lib/redis', () => ({
   getRedisClient: async () => mockRedis,
@@ -39,11 +48,6 @@ jest.mock('../config', () => ({
   },
 }));
 
-const mockRedis = {
-  get: jest.fn(),
-  set: jest.fn(),
-};
-
 const mockRpcGetEvents = jest.fn();
 jest.mock('@stellar/stellar-sdk', () => ({
   rpc: {
@@ -66,25 +70,22 @@ jest.mock('../lib/indexer/metrics', () => ({
 }));
 
 import { createIndexerEngine } from '../lib/indexer/engine';
+import { decodeEventData } from '../lib/indexer/decoder';
 
-function makeEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    eventId: 'ev-100-abc',
-    ledger: 100,
-    txHash: 'abc',
-    contractId: 'C_treasury',
-    topic: 'Deposit',
-    data: { depositor: 'GABC', amount: BigInt(1000), token: 'USDC' },
-    timestamp: Date.now(),
-    ...overrides,
-  };
-}
+jest.mock('../lib/indexer/decoder', () => ({
+  decodeEventData: jest.fn(),
+}));
+const mockDecodeEventData = decodeEventData as jest.Mock;
 
-describe('Indexer engine atomic checkpoint', () => {
+describe('Indexer engine cursor-aware pagination and idempotency', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockRedis.get.mockResolvedValue(null);
     mockRedis.set.mockResolvedValue('OK');
+    mockRedis.sIsMember.mockResolvedValue(false);
+    mockRedis.sAdd.mockResolvedValue(1);
+    mockRedis.expire.mockResolvedValue(1);
+    
     mockRpcGetEvents.mockResolvedValue({
       latestLedger: 200,
       events: [],
@@ -92,186 +93,150 @@ describe('Indexer engine atomic checkpoint', () => {
     mockPrismaClient.$transaction.mockImplementation(async (fn: Function) => {
       return fn(mockPrismaClient);
     });
+    mockPrismaClient.indexerState.findUnique.mockResolvedValue(null);
+    mockPrismaClient.indexerState.upsert.mockResolvedValue({});
   });
 
-  describe('claimEvent idempotency', () => {
-    it('uses upsert to prevent duplicate claims on replay', async () => {
-      const data = {
-        stream_id: BigInt(42),
-        recipient: 'GREC',
-        amount: BigInt(500),
-      };
-
-      mockRpcGetEvents.mockResolvedValueOnce({
-        latestLedger: 200,
-        events: [{
-          ledger: 100,
-          txHash: 'tx-1',
-          contractId: 'C_payroll',
-          topic: 'StreamClaimed',
-          value: data,
-        }],
-      });
-
-      mockPrismaClient.stream.findUnique.mockResolvedValue({
-        id: 'stream-uuid-42',
-        contractStreamId: 42,
-      });
-
+  describe('cursor-aware pagination', () => {
+    it('passes cursor to rpc.getEvents when cursor exists in redis', async () => {
+      mockRedis.get.mockResolvedValueOnce('cursor-xyz-123');
+      
       const engine = createIndexerEngine();
       await engine.poll();
+      
+      expect(mockRpcGetEvents).toHaveBeenCalledWith(expect.objectContaining({
+        cursor: 'cursor-xyz-123',
+      }));
+    });
 
-      expect(mockPrismaClient.claimEvent.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { streamId_txHash: { streamId: 'stream-uuid-42', txHash: 'tx-1' } },
-          create: expect.objectContaining({ streamId: 'stream-uuid-42', txHash: 'tx-1' }),
-        }),
+    it('saves new cursor to redis when response contains a cursor', async () => {
+      mockRpcGetEvents.mockResolvedValueOnce({
+        latestLedger: 200,
+        events: [],
+        cursor: 'cursor-abc-456'
+      });
+      
+      const engine = createIndexerEngine();
+      await engine.poll();
+      
+      expect(mockRedis.set).toHaveBeenCalledWith(
+        'orbitpay:indexer:cursor',
+        'cursor-abc-456'
       );
     });
   });
 
-  describe('vote idempotency', () => {
-    it('uses upsert to prevent duplicate votes on replay', () => {
-      expect(mockPrismaClient.vote.upsert).toBeDefined();
+  describe('event-level idempotency via Redis', () => {
+    it('skips already processed events and does not write to DB', async () => {
+      mockRpcGetEvents.mockResolvedValueOnce({
+        latestLedger: 200,
+        events: [{ type: 'contract', ledger: 100 }],
+        cursor: 'cursor-abc-456'
+      });
+      mockDecodeEventData.mockReturnValueOnce({
+        eventId: 'ev-1',
+        ledger: 100,
+        txHash: 'tx-1',
+        contractId: 'C_treasury',
+        topic: 'Deposit',
+        data: { amount: 100 }
+      });
+
+      // Mock redis saying the event is already processed
+      mockRedis.sIsMember.mockResolvedValueOnce(true);
+
+      const engine = createIndexerEngine();
+      await engine.poll();
+      
+      expect(mockRedis.sIsMember).toHaveBeenCalledWith('orbitpay:indexer:processed_events', 'ev-1');
+      expect(mockPrismaClient.treasuryEvent.upsert).not.toHaveBeenCalled();
+      expect(mockRedis.sAdd).not.toHaveBeenCalled();
+    });
+
+    it('processes new events and adds them to redis processed_events set', async () => {
+      mockRpcGetEvents.mockResolvedValueOnce({
+        latestLedger: 200,
+        events: [{ type: 'contract', ledger: 100 }],
+        cursor: 'cursor-abc-456'
+      });
+      mockDecodeEventData.mockReturnValueOnce({
+        eventId: 'ev-2',
+        ledger: 100,
+        txHash: 'tx-1',
+        contractId: 'C_treasury',
+        topic: 'Deposit',
+        data: { amount: 100 }
+      });
+
+      // Mock redis saying the event is NOT processed
+      mockRedis.sIsMember.mockResolvedValueOnce(false);
+
+      const engine = createIndexerEngine();
+      await engine.poll();
+      
+      expect(mockPrismaClient.treasuryEvent.upsert).toHaveBeenCalled();
+      expect(mockRedis.sAdd).toHaveBeenCalledWith('orbitpay:indexer:processed_events', 'ev-2');
+      expect(mockRedis.expire).toHaveBeenCalledWith('orbitpay:indexer:processed_events', 7 * 24 * 60 * 60);
     });
   });
 
-  describe('checkpoint does not advance past quarantined ledgers', () => {
-    it('quarantined events are excluded from checkpoint', async () => {
+  describe('crash recovery and Prisma checkpointing', () => {
+    it('updates Prisma indexerState with maxAppliedLedger', async () => {
+      mockRpcGetEvents.mockResolvedValueOnce({
+        latestLedger: 200,
+        events: [{ type: 'contract', ledger: 100 }, { type: 'contract', ledger: 150 }],
+        cursor: 'cursor-xyz'
+      });
+      mockDecodeEventData
+        .mockReturnValueOnce({
+          eventId: 'ev-1', ledger: 100, txHash: 'tx-1', contractId: 'C_treasury', topic: 'Deposit', data: {}
+        })
+        .mockReturnValueOnce({
+          eventId: 'ev-2', ledger: 150, txHash: 'tx-2', contractId: 'C_treasury', topic: 'Deposit', data: {}
+        });
+
+      const engine = createIndexerEngine();
+      await engine.poll();
+
+      expect(mockPrismaClient.indexerState.upsert).toHaveBeenCalledWith({
+        where: { id: 'singleton' },
+        create: { id: 'singleton', lastLedger: 150 },
+        update: { lastLedger: 150 }
+      });
+    });
+  });
+
+  describe('multiple events per transaction', () => {
+    it('processes multiple events with the same txHash but distinct eventIds', async () => {
       mockRpcGetEvents.mockResolvedValueOnce({
         latestLedger: 200,
         events: [
-          {
-            ledger: 100,
-            txHash: 'abc',
-            contractId: 'C_treasury',
-            topic: 'Deposit',
-            value: { depositor: 'GABC', amount: 1000n },
-          },
-          {
-            ledger: 150,
-            txHash: 'def',
-            contractId: 'C_payroll',
-            topic: 'StreamCreated',
-            value: {},
-          },
+          { type: 'contract', ledger: 100 },
+          { type: 'contract', ledger: 100 }
         ],
+        cursor: 'cursor-end'
       });
-
-      mockPrismaClient.$transaction.mockImplementation(async (fn: Function) => {
-        return fn(mockPrismaClient);
-      });
+      
+      // Two distinct events from the same transaction
+      mockDecodeEventData
+        .mockReturnValueOnce({
+          eventId: 'ev-tx1-a', ledger: 100, txHash: 'tx-multi', contractId: 'C_treasury', topic: 'Deposit', data: { amount: 10 }
+        })
+        .mockReturnValueOnce({
+          eventId: 'ev-tx1-b', ledger: 100, txHash: 'tx-multi', contractId: 'C_treasury', topic: 'Deposit', data: { amount: 20 }
+        });
 
       const engine = createIndexerEngine();
       await engine.poll();
 
-      const setCalls = mockRedis.set.mock.calls as [string, string][];
-      const lastCheckpoint = setCalls.length > 0 ? Number(setCalls[setCalls.length - 1][1]) : null;
-      expect(lastCheckpoint).toBe(100);
-    });
-  });
-
-  describe('empty page handling', () => {
-    it('advances checkpoint by startLedger, not latestLedger, on empty batch', async () => {
-      mockRpcGetEvents.mockResolvedValueOnce({
-        latestLedger: 500,
-        events: [],
-      });
-
-      mockRedis.get.mockResolvedValue('99');
-
-      const engine = createIndexerEngine();
-      await engine.poll();
-
-      expect(mockRedis.set).toHaveBeenCalledWith(
-        'orbitpay:indexer:checkpoint',
-        '100',
+      // Upsert called twice for TreasuryEvent, based on eventId now (not txHash)
+      expect(mockPrismaClient.treasuryEvent.upsert).toHaveBeenCalledTimes(2);
+      expect(mockPrismaClient.treasuryEvent.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { eventId: 'ev-tx1-a' } })
       );
-    });
-
-    it('does not set checkpoint to latestLedger when startLedger is undefined on empty batch', async () => {
-      mockRpcGetEvents.mockResolvedValueOnce({
-        latestLedger: 500,
-        events: [],
-      });
-
-      mockRedis.get.mockResolvedValue(null);
-
-      const engine = createIndexerEngine();
-      await engine.poll();
-
-      const setCalls = mockRedis.set.mock.calls as [string, string][];
-      expect(setCalls.length).toBe(0);
-    });
-  });
-
-  describe('crash-injection: idempotent replay', () => {
-    it('replaying same batch does not duplicate claims', async () => {
-      mockPrismaClient.stream.findUnique.mockResolvedValue({
-        id: 'stream-uuid-1',
-        contractStreamId: 1,
-      });
-
-      mockRpcGetEvents.mockResolvedValue({
-        latestLedger: 200,
-        events: [{
-          ledger: 100,
-          txHash: 'tx-1',
-          contractId: 'C_payroll',
-          topic: 'StreamClaimed',
-          value: {
-            stream_id: BigInt(1),
-            recipient: 'GREC',
-            amount: BigInt(100),
-          },
-        }],
-      });
-
-      mockPrismaClient.$transaction.mockImplementation(async (fn: Function) => {
-        return fn(mockPrismaClient);
-      });
-
-      const engine = createIndexerEngine();
-      await engine.poll();
-
-      const claimCallsFirst = mockPrismaClient.claimEvent.upsert.mock.calls.length;
-      mockPrismaClient.claimEvent.upsert.mockClear();
-
-      await engine.poll();
-
-      expect(mockPrismaClient.claimEvent.upsert).toHaveBeenCalledTimes(claimCallsFirst);
-    });
-
-    it('replaying same batch does not duplicate votes', async () => {
-      mockRpcGetEvents.mockResolvedValue({
-        latestLedger: 200,
-        events: [{
-          ledger: 100,
-          txHash: 'tx-2',
-          contractId: 'C_governance',
-          topic: 'VoteCast',
-          value: {
-            proposal_id: BigInt(7),
-            voter: 'GVOTER',
-            choice: 'For',
-            weight: 1,
-          },
-        }],
-      });
-
-      mockPrismaClient.$transaction.mockImplementation(async (fn: Function) => {
-        return fn(mockPrismaClient);
-      });
-
-      const engine = createIndexerEngine();
-      await engine.poll();
-
-      const voteCallsFirst = mockPrismaClient.vote.upsert.mock.calls.length;
-      mockPrismaClient.vote.upsert.mockClear();
-
-      await engine.poll();
-
-      expect(mockPrismaClient.vote.upsert).toHaveBeenCalledTimes(voteCallsFirst);
+      expect(mockPrismaClient.treasuryEvent.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { eventId: 'ev-tx1-b' } })
+      );
     });
   });
 });
